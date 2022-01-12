@@ -1,0 +1,376 @@
+CLASS ycl_abap_util DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC .
+
+  PUBLIC SECTION.
+
+    METHODS constructor
+      IMPORTING
+        VALUE(iv_custom_status) TYPE abap_bool DEFAULT ' '
+      EXCEPTIONS
+        helper_report_not_found .
+    METHODS display_deep_structure
+      IMPORTING
+        VALUE(table) TYPE ANY TABLE .
+  PROTECTED SECTION.
+  PRIVATE SECTION.
+
+    DATA:
+      display_stack TYPE STANDARD TABLE OF REF TO data .
+    CONSTANTS c_custom TYPE char1 VALUE 'C' ##NO_TEXT.
+    CONSTANTS c_standard TYPE char1 VALUE 'S' ##NO_TEXT.
+    DATA display_status TYPE char1 .
+    CONSTANTS c_stack_push TYPE char1 VALUE '1' ##NO_TEXT.
+    CONSTANTS c_stack_pop TYPE char1 VALUE '2' ##NO_TEXT.
+    CONSTANTS c_helper_report TYPE syrepid VALUE 'YYR_ABAP_STATUS' ##NO_TEXT.
+    CONSTANTS c_helper_report_status TYPE sypfkey VALUE 'SALV_STANDARD' ##NO_TEXT.
+
+    METHODS display_flat_table
+      IMPORTING
+        VALUE(table) TYPE ANY TABLE .
+    METHODS _get_type_handle
+      IMPORTING
+        !table      TYPE ANY TABLE
+      RETURNING
+        VALUE(data) TYPE REF TO data .
+    METHODS _fill_condensed_data
+      IMPORTING
+        VALUE(table)    TYPE ANY TABLE
+      CHANGING
+        !condensed_data TYPE ANY TABLE .
+    METHODS _display_condensed_alv
+      IMPORTING
+        VALUE(table)          TYPE ANY TABLE
+        VALUE(condensed_data) TYPE ANY TABLE OPTIONAL .
+    METHODS _handle_hotspot_click
+      FOR EVENT link_click OF cl_salv_events_table
+      IMPORTING
+        !row
+        !column .
+    METHODS _handle_added_function
+      FOR EVENT added_function OF cl_salv_events_table
+      IMPORTING
+        !e_salv_function .
+    METHODS _update_display_stack
+      IMPORTING
+        !table     TYPE ANY TABLE OPTIONAL
+        !operation TYPE char1
+      EXCEPTIONS
+        no_push_data .
+    METHODS _set_screen_status
+      CHANGING
+        !ref_alv TYPE REF TO cl_salv_table .
+ENDCLASS.
+
+
+
+CLASS YCL_ABAP_UTIL IMPLEMENTATION.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Public Method YCL_ABAP_UTIL->CONSTRUCTOR
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] IV_CUSTOM_STATUS               TYPE        ABAP_BOOL (default =' ')
+* | [EXC!] HELPER_REPORT_NOT_FOUND
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD constructor.
+    IF  iv_custom_status IS NOT SUPPLIED
+    OR  iv_custom_status = abap_false.
+      display_status = c_standard.
+      RETURN.
+    ENDIF.
+
+    SELECT SINGLE 'X' FROM trdir INTO @DATA(lv_exists) WHERE name = @c_helper_report.
+    IF lv_exists = abap_true.
+      display_status = c_custom.
+    ELSE.
+      "CREATE OBJECT FAILED as helper program not found in system
+      CLEAR display_status.
+      RAISE helper_report_not_found .
+    ENDIF.
+  ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Public Method YCL_ABAP_UTIL->DISPLAY_DEEP_STRUCTURE
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] TABLE                          TYPE        ANY TABLE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD display_deep_structure.
+    "Push display to display stack
+    _update_display_stack( table     =  table
+                           operation =  c_stack_push ).
+
+
+    "check if the table supplied contains any nested table
+    LOOP AT CAST cl_abap_structdescr( CAST  cl_abap_tabledescr( cl_abap_tabledescr=>describe_by_data( table ) )->get_table_line_type( ) )->get_components( )
+       TRANSPORTING NO FIELDS WHERE type->type_kind = cl_abap_elemdescr=>typekind_table.
+      EXIT.
+    ENDLOOP.
+    IF sy-subrc = 4.
+      "Means that no internal table exists within lines and the table can be displayed as it is.
+      display_flat_table( table ).
+    ELSE.
+      FIELD-SYMBOLS: <condensed_data> TYPE ANY TABLE.
+
+      "dispay a temporary alv showing condensed data, and activate hotspots on internal table columns
+*      get components of the internal table and create a new type to display
+      DATA(condensed_data_ref) = _get_type_handle( table ).
+
+      ASSIGN condensed_data_ref->* TO <condensed_data>.
+
+      _fill_condensed_data( EXPORTING table          = table
+                            CHANGING  condensed_data = <condensed_data> ).
+
+*     Now display this condensed data as ALV
+      _display_condensed_alv(
+        EXPORTING
+          table          = table
+          condensed_data = <condensed_data>
+      ).
+
+    ENDIF.
+  ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method YCL_ABAP_UTIL->DISPLAY_FLAT_TABLE
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] TABLE                          TYPE        ANY TABLE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD display_flat_table.
+    IF table IS NOT INITIAL.
+      cl_salv_table=>factory( IMPORTING r_salv_table = DATA(lo_alv)
+                              CHANGING t_table       = table ).
+    ENDIF.
+
+    IF lo_alv IS BOUND.
+      lo_alv->get_functions( )->set_all( abap_true ).
+      lo_alv->get_columns( )->set_optimize( abap_true ).
+      _set_screen_status( CHANGING ref_alv = lo_alv ).
+      LOOP AT CAST cl_abap_structdescr( CAST  cl_abap_tabledescr( cl_abap_tabledescr=>describe_by_data( table ) )->get_table_line_type( ) )->get_components( )
+          ASSIGNING FIELD-SYMBOL(<component>).
+        TRY .
+            lo_alv->get_columns( )->get_column( CONV #( <component>-name ) )->set_medium_text( CONV #( <component>-name ) ).
+          CATCH cx_salv_not_found.
+            "Do nothing: this is happening becuase table may contain an object reference which doesnt becomes part of alv columns
+            "Later I will develop more utilities to display objects also :)
+        ENDTRY.
+      ENDLOOP.
+      SET HANDLER _handle_added_function FOR lo_alv->get_event( ).
+      lo_alv->display( ).
+    ENDIF.
+  ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method YCL_ABAP_UTIL->_DISPLAY_CONDENSED_ALV
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] TABLE                          TYPE        ANY TABLE
+* | [--->] CONDENSED_DATA                 TYPE        ANY TABLE(optional)
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD _display_condensed_alv.
+    "This method will display condensed data as a simple SALV
+    "but it will activate hotspots on the columns with table kind
+
+    DATA(components) = CAST cl_abap_structdescr( CAST  cl_abap_tabledescr( cl_abap_tabledescr=>describe_by_data( table ) )->get_table_line_type( ) )->get_components( ).
+
+    cl_salv_table=>factory( IMPORTING r_salv_table = DATA(lo_alv)
+                            CHANGING t_table       = condensed_data ).
+    IF lo_alv IS BOUND.
+      lo_alv->get_functions( )->set_all( abap_true ).
+      lo_alv->get_columns( )->set_optimize( abap_true ).
+      _set_screen_status( CHANGING ref_alv = lo_alv ).
+      LOOP AT components ASSIGNING FIELD-SYMBOL(<component>) WHERE type->type_kind = cl_abap_elemdescr=>typekind_table.
+        CAST cl_salv_column_table( lo_alv->get_columns( )->get_column( CONV #( <component>-name ) ) )->set_cell_type( if_salv_c_cell_type=>hotspot  ).
+      ENDLOOP.
+      LOOP AT components ASSIGNING <component>.
+        TRY .
+            lo_alv->get_columns( )->get_column( CONV #( <component>-name ) )->set_medium_text( CONV #( <component>-name ) ).
+          CATCH cx_salv_not_found.
+            "Do nothing: this is happening becuase table may contain an object reference which doesnt becomes part of alv columns
+            "Later I will develop more utilities to display objects also :)
+        ENDTRY.
+      ENDLOOP.
+      SET HANDLER _handle_hotspot_click FOR lo_alv->get_event( ).
+      SET HANDLER _handle_added_function FOR lo_alv->get_event( ).
+      lo_alv->display( ).
+    ENDIF.
+
+  ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method YCL_ABAP_UTIL->_FILL_CONDENSED_DATA
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] TABLE                          TYPE        ANY TABLE
+* | [<-->] CONDENSED_DATA                 TYPE        ANY TABLE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD _fill_condensed_data.
+    "Fill condensed data
+    DATA(components) = CAST cl_abap_structdescr( CAST  cl_abap_tabledescr( cl_abap_tabledescr=>describe_by_data( table ) )->get_table_line_type( ) )->get_components( ).
+    FIELD-SYMBOLS: <tab> TYPE ANY TABLE.
+    LOOP AT table ASSIGNING FIELD-SYMBOL(<line>).
+      INSERT INITIAL LINE INTO TABLE condensed_data ASSIGNING FIELD-SYMBOL(<new_line>).
+      LOOP AT components ASSIGNING FIELD-SYMBOL(<component>).
+        CASE <component>-type->type_kind.
+          WHEN cl_abap_elemdescr=>typekind_table.
+            UNASSIGN <tab>.
+            ASSIGN COMPONENT <component>-name OF STRUCTURE <line> TO <tab>.
+            IF <tab> IS ASSIGNED.
+              ASSIGN COMPONENT <component>-name OF STRUCTURE <new_line> TO FIELD-SYMBOL(<tab_desc>).
+              IF <tab_desc> IS ASSIGNED.
+                <tab_desc> = |Standard Table: { lines( <tab> ) } items|.
+                UNASSIGN <tab_desc>.
+              ENDIF.
+            ENDIF.
+          WHEN OTHERS.
+            ASSIGN COMPONENT <component>-name OF STRUCTURE <line> TO  FIELD-SYMBOL(<value>).
+            IF <value> IS ASSIGNED.
+              ASSIGN COMPONENT <component>-name OF STRUCTURE <new_line> TO  FIELD-SYMBOL(<value_new>).
+              IF <value_new> IS ASSIGNED.
+                <value_new> = <value>.
+                UNASSIGN: <value>, <value_new>.
+              ENDIF.
+            ENDIF.
+        ENDCASE.
+      ENDLOOP.
+    ENDLOOP.
+
+  ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method YCL_ABAP_UTIL->_GET_TYPE_HANDLE
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] TABLE                          TYPE        ANY TABLE
+* | [<-()] DATA                           TYPE REF TO DATA
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD _get_type_handle.
+    DATA(lo_new_tab) = cl_abap_tabledescr=>create(  p_line_type  = cl_abap_structdescr=>create(
+       VALUE #(
+*       BASE VALUE #( ( name = wa-name type = wa-type ) )
+       FOR wa IN
+       CAST cl_abap_structdescr( CAST  cl_abap_tabledescr( cl_abap_tabledescr=>describe_by_data( table ) )->get_table_line_type( ) )->get_components( )
+                                                           ( SWITCH #( wa-type->type_kind
+                                                             WHEN cl_abap_elemdescr=>typekind_table
+                                                             THEN VALUE #( name = wa-name type = cl_abap_elemdescr=>get_c( p_length = 70 ) )
+                                                             ELSE VALUE #( name = wa-name type = wa-type ) ) ) ) )
+                                                    p_table_kind = cl_abap_tabledescr=>tablekind_std
+                                                    p_unique     = abap_false ). "Table Type
+    CREATE DATA data TYPE HANDLE lo_new_tab.
+  ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method YCL_ABAP_UTIL->_HANDLE_ADDED_FUNCTION
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] E_SALV_FUNCTION                LIKE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD _handle_added_function.
+    IF display_status = c_custom.
+      CASE e_salv_function.
+        WHEN 'C_BACK'.
+          _update_display_stack( operation = c_stack_pop ).
+          LEAVE TO SCREEN 0.
+        WHEN 'C_EXIT'.
+          "go to master data screen
+          DATA(lines) = lines( display_stack ).
+          MESSAGE: 'Under Development' TYPE 'S'.
+      ENDCASE.
+    ELSE.
+      _update_display_stack( operation = c_stack_pop ).
+      LEAVE TO SCREEN 0.
+    ENDIF.
+  ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method YCL_ABAP_UTIL->_HANDLE_HOTSPOT_CLICK
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] ROW                            LIKE
+* | [--->] COLUMN                         LIKE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD _handle_hotspot_click.
+    FIELD-SYMBOLS: <current_display> TYPE INDEX TABLE.
+    FIELD-SYMBOLS: <table> TYPE ANY TABLE.
+    DATA: current_display TYPE REF TO data.
+    READ TABLE display_stack INTO current_display INDEX 1.
+    ASSIGN current_display->* TO <current_display>.
+
+    READ TABLE <current_display> INDEX row ASSIGNING FIELD-SYMBOL(<row>).
+    IF <row> IS ASSIGNED.
+      ASSIGN COMPONENT column OF STRUCTURE <row> TO <table>.
+      IF <table> IS ASSIGNED.
+        display_deep_structure( <table>  ).
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method YCL_ABAP_UTIL->_SET_SCREEN_STATUS
+* +-------------------------------------------------------------------------------------------------+
+* | [<-->] REF_ALV                        TYPE REF TO CL_SALV_TABLE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD _set_screen_status.
+    DATA(lv_text) = VALUE string( ).
+    DATA(lv_text2) = 'Do not use the standard navigation buttons, restart the program if navigation is erratic.'.
+    IF display_status = c_custom.
+      ref_alv->set_screen_status( report   = c_helper_report
+                                  pfstatus = c_helper_report_status ).
+      lv_text = 'Use the Back button on ALV toolbar to navigate to previous screens.'.
+
+    ELSEIF display_status = c_standard.
+      ref_alv->set_screen_status( report   =  'SALV_DEMO_TABLE_FUNCTIONS'
+                                  pfstatus =  'SALV_STANDARD' ).
+
+      lv_text = 'Use the `My Function` button on ALV toolbar to navigate to previous screens.'.
+      LOOP AT ref_alv->get_functions( )->get_functions( ) INTO DATA(function).
+        IF function-r_function->get_name( ) = 'MYFUNCTION'.
+          function-r_function->set_icon( '@02@' ).
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+    "set top of page for salv
+    DATA(lo_header) = NEW cl_salv_form_layout_grid( ).
+    lo_header->create_label( row = 1 column = 1 )->set_text( lv_text ).
+    lo_header->create_flow( row = 2  column = 1 )->create_text( text = space ).
+    lo_header->create_flow( row = 3  column = 1 )->create_text( text = lv_text2 ).
+    ref_alv->set_top_of_list( lo_header ).
+  ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method YCL_ABAP_UTIL->_UPDATE_DISPLAY_STACK
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] TABLE                          TYPE        ANY TABLE(optional)
+* | [--->] OPERATION                      TYPE        CHAR1
+* | [EXC!] NO_PUSH_DATA
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD _update_display_stack.
+    CASE operation.
+      WHEN c_stack_pop.
+        DELETE display_stack INDEX 1.
+      WHEN c_stack_push.
+        IF table IS NOT SUPPLIED.
+          RAISE no_push_data.
+        ELSE.
+          "Update display stack
+          DATA: curr_disp TYPE REF TO data.
+          TYPE-POOLS abap.
+          DATA(handle) = CAST  cl_abap_tabledescr( cl_abap_tabledescr=>describe_by_data( table ) ).
+          FIELD-SYMBOLS: <table> TYPE ANY TABLE.
+          CREATE DATA curr_disp TYPE HANDLE handle.
+          ASSIGN curr_disp->* TO <table>.
+          LOOP AT table ASSIGNING FIELD-SYMBOL(<line>).
+            INSERT INITIAL LINE INTO TABLE <table> ASSIGNING FIELD-SYMBOL(<new_line>).
+            <new_line> = CORRESPONDING #( <line> ).
+          ENDLOOP.
+          INSERT curr_disp INTO display_stack INDEX 1.
+        ENDIF.
+    ENDCASE.
+  ENDMETHOD.
+ENDCLASS.
