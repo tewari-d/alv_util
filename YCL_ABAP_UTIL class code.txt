@@ -302,7 +302,7 @@ CLASS YCL_ABAP_UTIL IMPLEMENTATION.
     READ TABLE <current_display> INDEX row ASSIGNING FIELD-SYMBOL(<row>).
     IF <row> IS ASSIGNED.
       ASSIGN COMPONENT column OF STRUCTURE <row> TO <table>.
-      IF <table> IS ASSIGNED.
+      IF <table> IS ASSIGNED AND <table> IS NOT INITIAL.
         display_deep_structure( <table>  ).
       ENDIF.
     ENDIF.
