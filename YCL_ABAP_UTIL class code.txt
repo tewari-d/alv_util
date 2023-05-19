@@ -12,7 +12,7 @@ CLASS ycl_abap_util DEFINITION
         helper_report_not_found .
     METHODS display_deep_structure
       IMPORTING
-        VALUE(table) TYPE ANY TABLE .
+        VALUE(table) TYPE ANY.
   PROTECTED SECTION.
   PRIVATE SECTION.
 
@@ -105,7 +105,7 @@ CLASS YCL_ABAP_UTIL IMPLEMENTATION.
 
     "check if the table supplied contains any nested table
     LOOP AT CAST cl_abap_structdescr( CAST  cl_abap_tabledescr( cl_abap_tabledescr=>describe_by_data( table ) )->get_table_line_type( ) )->get_components( )
-       TRANSPORTING NO FIELDS WHERE type->type_kind = cl_abap_elemdescr=>typekind_table.
+       TRANSPORTING NO FIELDS WHERE type->kind = cl_abap_elemdescr=>kind_table OR type->kind = cl_abap_elemdescr=>kind_struct.
       EXIT.
     ENDLOOP.
     IF sy-subrc = 4.
@@ -182,7 +182,7 @@ CLASS YCL_ABAP_UTIL IMPLEMENTATION.
       lo_alv->get_functions( )->set_all( abap_true ).
       lo_alv->get_columns( )->set_optimize( abap_true ).
       _set_screen_status( CHANGING ref_alv = lo_alv ).
-      LOOP AT components ASSIGNING FIELD-SYMBOL(<component>) WHERE type->type_kind = cl_abap_elemdescr=>typekind_table.
+      LOOP AT components ASSIGNING FIELD-SYMBOL(<component>) WHERE type->kind = cl_abap_elemdescr=>kind_table OR type->kind = cl_abap_elemdescr=>kind_struct.
         CAST cl_salv_column_table( lo_alv->get_columns( )->get_column( CONV #( <component>-name ) ) )->set_cell_type( if_salv_c_cell_type=>hotspot  ).
       ENDLOOP.
       LOOP AT components ASSIGNING <component>.
@@ -211,6 +211,7 @@ CLASS YCL_ABAP_UTIL IMPLEMENTATION.
     "Fill condensed data
     DATA(components) = CAST cl_abap_structdescr( CAST  cl_abap_tabledescr( cl_abap_tabledescr=>describe_by_data( table ) )->get_table_line_type( ) )->get_components( ).
     FIELD-SYMBOLS: <tab> TYPE ANY TABLE.
+    FIELD-SYMBOLS: <str> TYPE ANY.
     LOOP AT table ASSIGNING FIELD-SYMBOL(<line>).
       INSERT INITIAL LINE INTO TABLE condensed_data ASSIGNING FIELD-SYMBOL(<new_line>).
       LOOP AT components ASSIGNING FIELD-SYMBOL(<component>).
@@ -222,6 +223,26 @@ CLASS YCL_ABAP_UTIL IMPLEMENTATION.
               ASSIGN COMPONENT <component>-name OF STRUCTURE <new_line> TO FIELD-SYMBOL(<tab_desc>).
               IF <tab_desc> IS ASSIGNED.
                 <tab_desc> = |Standard Table: { lines( <tab> ) } items|.
+                UNASSIGN <tab_desc>.
+              ENDIF.
+            ENDIF.
+          WHEN cl_abap_elemdescr=>typekind_struct1.
+            UNASSIGN <str>.
+            ASSIGN COMPONENT <component>-name OF STRUCTURE <line> TO <str>.
+            IF <str> IS ASSIGNED.
+              ASSIGN COMPONENT <component>-name OF STRUCTURE <new_line> TO <tab_desc>.
+              IF <tab_desc> IS ASSIGNED.
+                <tab_desc> = |Flat structure|.
+                UNASSIGN <tab_desc>.
+              ENDIF.
+            ENDIF.
+          WHEN cl_abap_elemdescr=>typekind_struct2.
+            UNASSIGN <str>.
+            ASSIGN COMPONENT <component>-name OF STRUCTURE <line> TO <str>.
+            IF <str> IS ASSIGNED.
+              ASSIGN COMPONENT <component>-name OF STRUCTURE <new_line> TO <tab_desc>.
+              IF <tab_desc> IS ASSIGNED.
+                <tab_desc> = |Deep structure|.
                 UNASSIGN <tab_desc>.
               ENDIF.
             ENDIF.
@@ -253,8 +274,8 @@ CLASS YCL_ABAP_UTIL IMPLEMENTATION.
 *       BASE VALUE #( ( name = wa-name type = wa-type ) )
        FOR wa IN
        CAST cl_abap_structdescr( CAST  cl_abap_tabledescr( cl_abap_tabledescr=>describe_by_data( table ) )->get_table_line_type( ) )->get_components( )
-                                                           ( SWITCH #( wa-type->type_kind
-                                                             WHEN cl_abap_elemdescr=>typekind_table
+                                                           ( SWITCH #( wa-type->kind
+                                                             WHEN cl_abap_elemdescr=>kind_table OR cl_abap_elemdescr=>kind_struct
                                                              THEN VALUE #( name = wa-name type = cl_abap_elemdescr=>get_c( p_length = 70 ) )
                                                              ELSE VALUE #( name = wa-name type = wa-type ) ) ) ) )
                                                     p_table_kind = cl_abap_tabledescr=>tablekind_std
@@ -294,14 +315,24 @@ CLASS YCL_ABAP_UTIL IMPLEMENTATION.
 * +--------------------------------------------------------------------------------------</SIGNATURE>
   METHOD _handle_hotspot_click.
     FIELD-SYMBOLS: <current_display> TYPE INDEX TABLE.
-    FIELD-SYMBOLS: <table> TYPE ANY TABLE.
+    FIELD-SYMBOLS: <table> TYPE STANDARD TABLE.
+    FIELD-SYMBOLS: <field> TYPE ANY.
     DATA: current_display TYPE REF TO data.
     READ TABLE display_stack INTO current_display INDEX 1.
     ASSIGN current_display->* TO <current_display>.
 
     READ TABLE <current_display> INDEX row ASSIGNING FIELD-SYMBOL(<row>).
     IF <row> IS ASSIGNED.
-      ASSIGN COMPONENT column OF STRUCTURE <row> TO <table>.
+      ASSIGN COMPONENT column OF STRUCTURE <row> TO <field>.
+        IF cl_abap_typedescr=>describe_by_data( <field> )->kind = cl_abap_typedescr=>kind_struct.
+          DATA: table_of_structure TYPE REF TO DATA.
+          DATA(structure_type) = cl_abap_typedescr=>describe_by_data( <field> )->absolute_name.
+          CREATE DATA table_of_structure TYPE STANDARD TABLE OF (structure_type).
+          ASSIGN table_of_structure->* TO <table>.
+          APPEND <field> to <table>.
+        ELSE.
+          ASSIGN <field> to <table>.
+        ENDIF.
       IF <table> IS ASSIGNED AND <table> IS NOT INITIAL.
         display_deep_structure( <table>  ).
       ENDIF.
